@@ -6,12 +6,15 @@ if (!apiKey) {
   console.error("⚠️ GEMINI_API_KEY is missing in your .env file!");
 }
 
-// Initialize Gemini Client
 const ai = new GoogleGenAI({ apiKey });
 
-/**
- * System prompt instructing Gemini on how to evaluate group messages and formulate friendly replies.
- */
+// List of fallback model endpoints in order of preference
+const MODEL_FALLBACKS = [
+  "gemini-2.5-flash",
+  "gemini-2.0-flash",
+  "gemini-1.5-flash",
+];
+
 const SYSTEM_INSTRUCTION = `
 You are an AI assistant analyzing group messages for an automated account.
 Your goal is twofold:
@@ -48,11 +51,40 @@ YOU MUST RESPOND ONLY WITH A VALID JSON OBJECT matching this exact structure:
 `;
 
 /**
+ * Executes a Gemini request with model fallbacks and exponential backoff retry.
+ */
+async function generateContentWithRetry(prompt, maxRetries = 3) {
+  for (const modelName of MODEL_FALLBACKS) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const response = await ai.models.generateContent({
+          model: modelName,
+          contents: prompt,
+          config: {
+            systemInstruction: SYSTEM_INSTRUCTION,
+            responseMimeType: "application/json",
+          },
+        });
+        return response; // Success! Return response immediately
+      } catch (error) {
+        const is503 = error.message?.includes("503") || error.message?.includes("UNAVAILABLE");
+        
+        if (is503 && attempt < maxRetries) {
+          const delayMs = attempt * 2000; // 2s, 4s delay
+          console.warn(`⚠️ [${modelName}] Busy (503). Retrying in ${delayMs / 1000}s (Attempt ${attempt}/${maxRetries})...`);
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        } else {
+          console.warn(`❌ Model [${modelName}] failed on attempt ${attempt}:`, error.message);
+          break; // Move to next fallback model
+        }
+      }
+    }
+  }
+  throw new Error("All Gemini model endpoints failed after retries.");
+}
+
+/**
  * Analyzes an incoming Telegram message and returns structured lead scoring + response generation.
- * @param {string} userMessage - Text content of the received message
- * @param {string} senderName - Name/Username of the sender
- * @param {string} targetTopic - Group niche context (e.g., "Crypto", "Forex", "Healthcare", "NGO")
- * @param {number} currentScore - Existing prospect percentage for this user (0 - 100)
  */
 async function processIncomingMessage(userMessage, senderName = "User", targetTopic = "General", currentScore = 20) {
   try {
@@ -66,23 +98,13 @@ Context:
 Evaluate this message, update the score delta, and formulate a reply if appropriate.
 `;
 
-    // Request structured response from Gemini
-    const response = await ai.models.generateContent({
-      model: "gemini-3.8-flash",
-      contents: prompt,
-      config: {
-        systemInstruction: SYSTEM_INSTRUCTION,
-        responseMimeType: "application/json",
-      },
-    });
-
+    const response = await generateContentWithRetry(prompt);
     const result = JSON.parse(response.text);
 
     // Calculate updated Lead Prospect Percentage (capped between 0% and 100%)
     const rawDelta = result.evaluation?.intentScoreDelta || 0;
     const updatedScore = Math.min(100, Math.max(0, currentScore + rawDelta));
 
-    // Determine Prospect Tier
     let tier = "Cold";
     if (updatedScore >= 80) tier = "Hot";
     else if (updatedScore >= 40) tier = "Warm";
@@ -97,14 +119,14 @@ Evaluate this message, update the score delta, and formulate a reply if appropri
       botReply: result.botReply || { shouldReply: false, responseText: "" },
     };
   } catch (error) {
-    console.error("❌ Gemini Processing Error:", error.message);
+    console.error("❌ Gemini Service Error:", error.message);
     return {
       evaluation: {
         intentScoreDelta: 0,
         previousScore: currentScore,
         updatedScore: currentScore,
         tier: currentScore >= 80 ? "Hot" : currentScore >= 40 ? "Warm" : "Cold",
-        reasoning: "Error processing request",
+        reasoning: "Failed to obtain Gemini evaluation after retries.",
       },
       botReply: { shouldReply: false, responseText: "" },
     };
